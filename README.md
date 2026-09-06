@@ -33,9 +33,11 @@ transports an OpenPGP block.
 
 Hiding the subject is on by default: the outer header carries a bare `...` and
 the real subject travels inside the encrypted part (protected headers, plus the
-first line of the body so it stays visible in any client). The trade-off is
-that the recipient's inbox list also shows `...` — the real subject appears
-once the message is opened.
+first line of the body so it stays visible in any client). Clients that
+understand protected headers — Proton Mail and Thunderbird among them — show
+the real subject once the message is open, marked with a padlock. The
+trade-off is the mailbox list, which shows `...` for every such mail. See
+[First test](#first-test--hello-world) for what that looks like.
 
 ---
 
@@ -186,9 +188,15 @@ sudo send-secure-mail "hello world"
 sudo send-secure-mail --show-subject -s "hello world" "if you can read this, it works"
 ```
 
-**What should arrive:** a normal, readable message. With the default encrypted
-subject the inbox list shows `...`, and the real subject appears as the first
-line once you open it.
+**What should arrive:**
+
+![Encrypted test mail decrypted in Proton Mail: padlocked subject line, plain readable body](docs/images/testmail.png)
+
+A normal, readable message. Note the two subject lines: the mailbox list shows
+`...` — that is all Gmail carried — while the opened message shows the real
+subject next to a padlock, which is Proton reading the *protected header* from
+inside the encrypted part. The first body line repeats it for clients that do
+not render protected headers.
 
 **Proof that Gmail never saw the text:** open the *Sent* folder of the Gmail
 account that delivered it and look at the same message — there you see only
