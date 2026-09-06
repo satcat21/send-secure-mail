@@ -1,0 +1,639 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+send-secure-mail - send end-to-end encrypted logs and messages to any
+OpenPGP recipient, delivered through Gmail (sendmail/msmtp or direct SMTP).
+
+The plaintext is encrypted locally with GnuPG against the recipient's public
+OpenPGP key and sent as PGP/MIME (RFC 3156, multipart/encrypted). Gmail only
+ever sees ciphertext plus the SMTP metadata (From/To/Date/Subject).
+
+Configuration: /etc/send-secure-mail/config.ini or
+               ~/.config/send-secure-mail/config.ini
+               (or $SEND_SECURE_MAIL_CONFIG)
+"""
+
+import argparse
+import configparser
+import gzip
+import os
+import re
+import shutil
+import smtplib
+import socket
+import ssl
+import subprocess
+import sys
+from datetime import datetime
+from email.header import Header
+from email.message import Message
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.policy import SMTP as SMTP_POLICY
+from email.utils import formataddr, formatdate, make_msgid, parseaddr
+
+VERSION = "1.0.0"
+
+CONFIG_PATHS = [
+    os.environ.get("SEND_SECURE_MAIL_CONFIG"),
+    os.path.expanduser("~/.config/send-secure-mail/config.ini"),
+    "/etc/send-secure-mail/config.ini",
+]
+
+DEFAULTS = {
+    "recipient": "",
+    "recipient_key": "/etc/send-secure-mail/recipient.asc",
+    "recipient_fingerprint": "",
+    "verify_fingerprint": "yes",
+    "sender": "",
+    "sender_name": "",
+    "transport": "sendmail",
+    "sendmail_path": "/usr/sbin/sendmail",
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": "587",
+    "smtp_user": "",
+    "smtp_password_file": "",
+    "smtp_starttls": "yes",
+    "gpg_path": "gpg",
+    "sign_key": "",
+    "sign_passphrase_file": "",
+    "hide_subject": "yes",
+    "subject_prefix": "",
+    "max_attachment_bytes": str(5 * 1024 * 1024),
+    "gzip_attachments": "yes",
+}
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class Fail(Exception):
+    """Error with a message meant for the user."""
+
+
+def warn(msg):
+    sys.stderr.write("send-secure-mail: WARNING: %s\n" % msg)
+
+
+def info(msg, quiet=False):
+    if not quiet:
+        sys.stderr.write("send-secure-mail: %s\n" % msg)
+
+
+def enc_hdr(value):
+    """Header value as pure ASCII (RFC 2047), independent of email policy."""
+    try:
+        value.encode("ascii")
+        return value
+    except UnicodeEncodeError:
+        return Header(value, "utf-8").encode()
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+def load_config(explicit):
+    cfg = dict(DEFAULTS)
+    used = None
+    paths = [explicit] if explicit else CONFIG_PATHS
+    for path in paths:
+        if not path:
+            continue
+        path = os.path.expanduser(path)
+        if not os.path.isfile(path):
+            continue
+        parser = configparser.ConfigParser()
+        try:
+            parser.read(path, encoding="utf-8")
+        except configparser.Error as exc:
+            raise Fail("Malformed configuration file %s: %s" % (path, exc))
+        section = "send-secure-mail"
+        if not parser.has_section(section):
+            section = parser.sections()[0] if parser.sections() else None
+        if section:
+            for key, value in parser.items(section):
+                cfg[key.strip().lower()] = value.strip()
+        used = path
+        break
+    if explicit and not used:
+        raise Fail("Configuration file not found: %s" % explicit)
+    # Environment variables (SSM_*) take precedence over the file
+    for key in list(cfg):
+        env = os.environ.get("SSM_" + key.upper())
+        if env is not None:
+            cfg[key] = env
+    return cfg, used
+
+
+def as_bool(value, default=False):
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "yes", "true", "on", "y")
+
+
+def read_secret_file(path, what):
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        raise Fail("%s not found: %s" % (what, path))
+    if os.name == "posix" and os.stat(path).st_mode & 0o077:
+        warn("%s is readable by other users - please run 'chmod 600 %s'."
+             % (path, path))
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read().strip()
+
+
+# --------------------------------------------------------------------------
+# GnuPG
+# --------------------------------------------------------------------------
+
+def gpg_run(gpg, args, stdin=None):
+    cmd = [gpg, "--batch", "--no-tty", "--yes"] + args
+    try:
+        return subprocess.run(cmd, input=stdin, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, check=False)
+    except FileNotFoundError:
+        raise Fail("GnuPG not found (%s). Install it, e.g. 'apt install gnupg'."
+                   % gpg)
+
+
+def key_fingerprints(gpg, key_file):
+    proc = gpg_run(gpg, ["--with-colons", "--show-keys", key_file])
+    if proc.returncode != 0:
+        raise Fail("Could not read the key file:\n%s"
+                   % proc.stderr.decode("utf-8", "replace").strip())
+    fprs = []
+    want = False
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        fields = line.split(":")
+        if fields[0] in ("pub", "sub"):
+            want = True
+        elif fields[0] == "fpr" and want:
+            fprs.append(fields[9])
+            want = False
+    return fprs
+
+
+def normalize_fpr(value):
+    return re.sub(r"[^0-9A-Fa-f]", "", value or "").upper()
+
+
+def encrypt(cfg, plaintext, quiet):
+    gpg = cfg["gpg_path"]
+    args = ["--armor", "--encrypt"]
+
+    key_file = os.path.expanduser(cfg.get("recipient_key") or "")
+    fpr_cfg = normalize_fpr(cfg.get("recipient_fingerprint"))
+
+    if key_file and os.path.isfile(key_file):
+        if as_bool(cfg.get("verify_fingerprint"), True) and fpr_cfg:
+            found = [normalize_fpr(f) for f in key_fingerprints(gpg, key_file)]
+            if fpr_cfg not in found:
+                raise Fail(
+                    "Fingerprint check failed!\n"
+                    "  expected: %s\n"
+                    "  found:    %s\n"
+                    "  file:     %s\n"
+                    "Nothing was encrypted and nothing was sent."
+                    % (fpr_cfg, ", ".join(found) or "(none)", key_file))
+        # --recipient-file bypasses the keyring and the trust database:
+        # we encrypt to exactly this verified key file.
+        args += ["--recipient-file", key_file]
+    elif fpr_cfg:
+        # Fallback: the key already lives in the keyring
+        args += ["--trust-model", "always", "--recipient", fpr_cfg]
+    else:
+        raise Fail("No recipient key configured "
+                   "(recipient_key or recipient_fingerprint).")
+
+    sign_key = (cfg.get("sign_key") or "").strip()
+    if sign_key:
+        args += ["--sign", "--local-user", sign_key]
+        passfile = (cfg.get("sign_passphrase_file") or "").strip()
+        if passfile:
+            args += ["--pinentry-mode", "loopback",
+                     "--passphrase-file", os.path.expanduser(passfile)]
+
+    proc = gpg_run(gpg, args, plaintext)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise Fail("Encryption failed:\n%s"
+                   % proc.stderr.decode("utf-8", "replace").strip())
+    return proc.stdout.decode("ascii", "replace")
+
+
+# --------------------------------------------------------------------------
+# Collecting content
+# --------------------------------------------------------------------------
+
+def truncate_tail(data, limit, label):
+    """Trim large logs to the last `limit` bytes (the tail is what matters)."""
+    if limit <= 0 or len(data) <= limit:
+        return data
+    cut = data[-limit:]
+    nl = cut.find(b"\n")
+    if 0 <= nl < 4096:
+        cut = cut[nl + 1:]
+    note = ("[send-secure-mail] %s: truncated to the last %d of %d bytes.\n"
+            "[send-secure-mail] --- start of truncated output ---\n"
+            % (label, len(cut), len(data)))
+    return note.encode("utf-8") + cut
+
+
+def collect_journal(args):
+    if not shutil.which("journalctl"):
+        raise Fail("journalctl not found - --journal requires systemd.")
+    cmd = ["journalctl", "--no-pager", "--since", args.journal_since]
+    for unit in (args.journal_unit or []):
+        cmd += ["-u", unit]
+    if args.journal_priority:
+        cmd += ["-p", args.journal_priority]
+    if args.journal_boot:
+        cmd += ["-b"]
+    if args.journal_lines:
+        cmd += ["-n", str(args.journal_lines)]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        raise Fail("journalctl failed:\n%s"
+                   % proc.stderr.decode("utf-8", "replace").strip())
+    return proc.stdout
+
+
+def make_attachment(name, data, use_gzip):
+    if use_gzip and not name.endswith((".gz", ".zip", ".xz", ".zst", ".bz2")):
+        data = gzip.compress(data, 6)
+        name = name + ".gz"
+        subtype = "gzip"
+    else:
+        subtype = "octet-stream"
+    part = MIMEApplication(data, _subtype=subtype)
+    part.add_header("Content-Disposition", "attachment", filename=name)
+    return part
+
+
+# --------------------------------------------------------------------------
+# Building the MIME message
+# --------------------------------------------------------------------------
+
+def build_inner(body, attachments, protected):
+    """The MIME message to be encrypted, canonicalized to CRLF (RFC 3156)."""
+    text = MIMEText(body, "plain", "utf-8")
+    if attachments:
+        inner = MIMEMultipart("mixed")
+        inner.attach(text)
+        for part in attachments:
+            inner.attach(part)
+    else:
+        inner = text
+
+    if protected:
+        # Protected headers: the real subject only exists inside the
+        # encrypted part; the outside carries a placeholder.
+        inner.set_param("protected-headers", "v1")
+        for key, value in protected.items():
+            if value:
+                del inner[key]
+                inner[key] = enc_hdr(value)
+    return inner.as_bytes(policy=SMTP_POLICY)
+
+
+def build_outer(sender, sender_name, recipient, subject, ciphertext,
+                extra_headers):
+    outer = MIMEMultipart(_subtype="encrypted",
+                          protocol="application/pgp-encrypted")
+    outer["From"] = (formataddr((enc_hdr(sender_name), sender))
+                     if sender_name else sender)
+    outer["To"] = recipient
+    outer["Subject"] = enc_hdr(subject)
+    outer["Date"] = formatdate(localtime=True)
+    outer["Message-ID"] = make_msgid(domain=sender.split("@")[-1])
+    outer["User-Agent"] = "send-secure-mail/%s" % VERSION
+    for key, value in extra_headers.items():
+        if value:
+            outer[key] = value
+    outer.preamble = ("This is an OpenPGP/MIME encrypted message "
+                      "(RFC 4880 and 3156).")
+
+    version = Message()
+    version.add_header("Content-Type", "application/pgp-encrypted")
+    version.add_header("Content-Description", "PGP/MIME version identification")
+    version.set_payload("Version: 1\n")
+
+    payload = Message()
+    payload.add_header("Content-Type", "application/octet-stream",
+                       name="encrypted.asc")
+    payload.add_header("Content-Description", "OpenPGP encrypted message")
+    payload.add_header("Content-Disposition", "inline", filename="encrypted.asc")
+    payload.set_payload(ciphertext)
+
+    outer.attach(version)
+    outer.attach(payload)
+    return outer
+
+
+# --------------------------------------------------------------------------
+# Delivery
+# --------------------------------------------------------------------------
+
+def send_sendmail(cfg, message, sender, recipient, quiet):
+    path = cfg["sendmail_path"]
+    if not os.path.exists(path):
+        alt = shutil.which("sendmail") or shutil.which("msmtp")
+        if not alt:
+            raise Fail("sendmail not found (%s). Install an MTA such as "
+                       "'msmtp-mta', or set transport = smtp." % path)
+        path = alt
+    cmd = [path, "-i", "-f", sender, "--", recipient]
+    proc = subprocess.run(cmd, input=message.as_bytes(),
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    out = proc.stdout.decode("utf-8", "replace").strip()
+    if proc.returncode != 0:
+        raise Fail("sendmail exited with code %d:\n%s" % (proc.returncode, out))
+    if out:
+        info(out, quiet)
+
+
+def send_smtp(cfg, message, sender, recipient, quiet):
+    host = cfg["smtp_host"]
+    port = int(cfg["smtp_port"])
+    user = cfg.get("smtp_user") or sender
+    password = os.environ.get("SSM_SMTP_PASSWORD")
+    if not password:
+        pwfile = (cfg.get("smtp_password_file") or "").strip()
+        if not pwfile:
+            raise Fail("No SMTP password configured "
+                       "(smtp_password_file or $SSM_SMTP_PASSWORD).")
+        password = read_secret_file(pwfile, "SMTP password file")
+    context = ssl.create_default_context()
+    data = message.as_bytes(policy=SMTP_POLICY)
+    try:
+        if port == 465:
+            server = smtplib.SMTP_SSL(host, port, timeout=60, context=context)
+        else:
+            server = smtplib.SMTP(host, port, timeout=60)
+        with server:
+            server.ehlo()
+            if port != 465 and as_bool(cfg.get("smtp_starttls"), True):
+                server.starttls(context=context)
+                server.ehlo()
+            server.login(user, password)
+            server.sendmail(sender, [recipient], data)
+    except smtplib.SMTPAuthenticationError as exc:
+        raise Fail("SMTP login failed. Gmail requires an app password "
+                   "(enable 2-step verification, then visit "
+                   "https://myaccount.google.com/apppasswords).\n%s" % exc)
+    except (smtplib.SMTPException, OSError, ssl.SSLError) as exc:
+        raise Fail("SMTP delivery failed: %s" % exc)
+    info("handed over to %s:%d" % (host, port), quiet)
+
+
+# --------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------
+
+EPILOG = """examples:
+  send-secure-mail "backup finished"
+  send-secure-mail -s "Nightly" --attach /var/log/syslog
+  send-secure-mail you@example.org "secret text"
+  journalctl -p err -S -1d | send-secure-mail -s "errors today"
+  send-secure-mail --journal --journal-priority err -s "journal"
+  send-secure-mail --test
+"""
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="send-secure-mail",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Send encrypted (PGP/MIME) logs to an OpenPGP recipient.",
+        epilog=EPILOG)
+    parser.add_argument("words", nargs="*", metavar="TEXT",
+                        help="message text; if the first word is an email "
+                             "address it is taken as the recipient")
+    parser.add_argument("-t", "--to", help="recipient (overrides the config)")
+    parser.add_argument("-s", "--subject",
+                        help="subject (encrypted unless --show-subject)")
+    parser.add_argument("-a", "--attach", action="append", default=[],
+                        metavar="FILE", help="attach a file (repeatable)")
+    parser.add_argument("--stdin", action="store_true",
+                        help="read the message body from stdin")
+    parser.add_argument("--stdin-attach", metavar="NAME",
+                        help="attach stdin under this name instead of using "
+                             "it as the body")
+    parser.add_argument("--journal", action="store_true",
+                        help="attach journalctl output")
+    parser.add_argument("--journal-since", default="-1d",
+                        help="time range for --journal, default -1d. Pass "
+                             "values starting with a dash using an equals "
+                             "sign: --journal-since=-2d")
+    parser.add_argument("--journal-unit", action="append", metavar="UNIT",
+                        help="restrict to this systemd unit (repeatable)")
+    parser.add_argument("--journal-priority", metavar="PRIO",
+                        help="priority filter, e.g. err or 0..3")
+    parser.add_argument("--journal-boot", action="store_true",
+                        help="current boot only")
+    parser.add_argument("--journal-lines", type=int, metavar="N",
+                        help="last N lines only")
+    parser.add_argument("--gzip", dest="gzip", action="store_true", default=None,
+                        help="gzip attachments (default)")
+    parser.add_argument("--no-gzip", dest="gzip", action="store_false",
+                        help="do not compress attachments")
+    parser.add_argument("--max-size", type=int, metavar="BYTES",
+                        help="truncate attachments to this size (0 = no limit)")
+    parser.add_argument("--hide-subject", dest="hide_subject",
+                        action="store_true", default=None,
+                        help="transmit the real subject encrypted only "
+                             "(default)")
+    parser.add_argument("--show-subject", dest="hide_subject",
+                        action="store_false",
+                        help="keep the subject in the plaintext header, so it "
+                             "is visible to Gmail")
+    parser.add_argument("--sign", action="store_true",
+                        help="sign as well (requires sign_key)")
+    parser.add_argument("--transport", choices=["sendmail", "smtp"],
+                        help="delivery path")
+    parser.add_argument("-c", "--config", help="path to the configuration file")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the finished message instead of sending")
+    parser.add_argument("--test", action="store_true",
+                        help="send a test message")
+    parser.add_argument("--show-key", action="store_true",
+                        help="show the configured recipient key")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="less output")
+    parser.add_argument("-V", "--version", action="version",
+                        version="send-secure-mail " + VERSION)
+    return parser
+
+
+def show_key(cfg, cfg_path):
+    key_file = os.path.expanduser(cfg.get("recipient_key") or "")
+    print("Configuration:        %s" % (cfg_path or "(none found)"))
+    print("Recipient:            %s" % (cfg.get("recipient") or "(not set)"))
+    print("Key file:             %s" % (key_file or "(not set)"))
+    print("Fingerprint (config): %s"
+          % (cfg.get("recipient_fingerprint") or "(not set)"))
+    print("Transport:            %s" % cfg.get("transport"))
+    if key_file and os.path.isfile(key_file):
+        proc = gpg_run(cfg["gpg_path"], ["--show-keys", key_file])
+        print()
+        print(proc.stdout.decode("utf-8", "replace").strip())
+    else:
+        warn("Key file is missing.")
+    return 0
+
+
+def main(argv):
+    args = build_parser().parse_args(argv)
+    cfg, cfg_path = load_config(args.config)
+    quiet = args.quiet
+
+    if args.show_key:
+        return show_key(cfg, cfg_path)
+
+    # --- recipient and sender ---------------------------------------------
+    words = list(args.words)
+    recipient = args.to or ""
+    if not recipient and words and EMAIL_RE.match(words[0]):
+        recipient = words.pop(0)
+    if not recipient:
+        recipient = cfg.get("recipient", "")
+    if not recipient:
+        raise Fail("No recipient given (--to, or recipient in the config).")
+    if not EMAIL_RE.match(recipient):
+        raise Fail("Invalid recipient address: %s" % recipient)
+
+    sender = cfg.get("sender") or cfg.get("smtp_user") or ""
+    if not sender:
+        raise Fail("No sender configured (sender in the config).")
+    sender = parseaddr(sender)[1] or sender
+
+    if args.transport:
+        cfg["transport"] = args.transport
+    if args.sign and not (cfg.get("sign_key") or "").strip():
+        raise Fail("--sign requires sign_key in the configuration.")
+
+    use_gzip = (args.gzip if args.gzip is not None
+                else as_bool(cfg["gzip_attachments"], True))
+    max_size = (args.max_size if args.max_size is not None
+                else int(cfg["max_attachment_bytes"]))
+    hide_subject = (args.hide_subject if args.hide_subject is not None
+                    else as_bool(cfg["hide_subject"], True))
+
+    host = socket.gethostname()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # --- collect the content ----------------------------------------------
+    body_parts = []
+    attachments = []
+
+    if args.test:
+        body_parts.append(
+            "Test message from send-secure-mail.\n\n"
+            "Host:       %s\n"
+            "Time:       %s\n"
+            "Sender:     %s\n"
+            "Recipient:  %s\n"
+            "Transport:  %s\n"
+            "Config:     %s\n\n"
+            "If you can read this text in your mailbox, end-to-end "
+            "encryption is working."
+            % (host, now, sender, recipient, cfg["transport"], cfg_path))
+
+    text_words = " ".join(words).strip()
+    if text_words:
+        body_parts.append(text_words)
+
+    read_stdin = args.stdin or bool(args.stdin_attach)
+    if (not read_stdin and not text_words and not args.test
+            and not sys.stdin.isatty()):
+        read_stdin = True
+    if read_stdin:
+        stdin_data = sys.stdin.buffer.read()
+        if args.stdin_attach:
+            attachments.append(make_attachment(
+                args.stdin_attach,
+                truncate_tail(stdin_data, max_size, args.stdin_attach),
+                use_gzip))
+        elif stdin_data.strip():
+            body_parts.append(truncate_tail(stdin_data, max_size, "stdin")
+                              .decode("utf-8", "replace").rstrip())
+
+    for path in args.attach:
+        path = os.path.expanduser(path)
+        if not os.path.isfile(path):
+            raise Fail("Attachment not found: %s" % path)
+        with open(path, "rb") as handle:
+            data = handle.read()
+        name = os.path.basename(path)
+        attachments.append(make_attachment(
+            name, truncate_tail(data, max_size, name), use_gzip))
+
+    if args.journal:
+        data = collect_journal(args)
+        name = "journal-%s-%s.log" % (host,
+                                      datetime.now().strftime("%Y%m%d-%H%M%S"))
+        attachments.append(make_attachment(
+            name, truncate_tail(data, max_size, "journal"), use_gzip))
+
+    if not body_parts and not attachments:
+        raise Fail("Nothing to send (no text, no attachment, nothing on stdin).")
+    if not body_parts:
+        names = ", ".join(p.get_filename() or "?" for p in attachments)
+        body_parts.append("Automated report from %s (%s).\nAttachments: %s"
+                          % (host, now, names))
+
+    body = "\n\n".join(body_parts).rstrip() + "\n"
+
+    # --- subject -----------------------------------------------------------
+    subject = args.subject
+    if not subject:
+        subject = ("send-secure-mail test" if args.test
+                   else "Logs %s %s"
+                        % (host, datetime.now().strftime("%Y-%m-%d %H:%M")))
+    prefix = (cfg.get("subject_prefix") or "").strip()
+    if prefix:
+        subject = "%s %s" % (prefix, subject)
+
+    protected = None
+    outer_subject = subject
+    if hide_subject:
+        outer_subject = "..."
+        protected = {"Subject": subject, "From": sender, "To": recipient}
+        # Also as plain text inside the encrypted part, in case the client
+        # does not render protected headers.
+        body = "Subject: %s\n\n%s" % (subject, body)
+
+    # --- encrypt, wrap, send ------------------------------------------------
+    plaintext = build_inner(body, attachments, protected)
+    ciphertext = encrypt(cfg, plaintext, quiet)
+
+    message = build_outer(sender, cfg.get("sender_name", ""), recipient,
+                          outer_subject, ciphertext,
+                          {"Auto-Submitted": "auto-generated"})
+
+    if args.dry_run:
+        sys.stdout.buffer.write(message.as_bytes())
+        sys.stdout.buffer.flush()
+        info("--dry-run: nothing sent (%d bytes of ciphertext)."
+             % len(ciphertext), quiet)
+        return 0
+
+    if cfg["transport"] == "smtp":
+        send_smtp(cfg, message, sender, recipient, quiet)
+    else:
+        send_sendmail(cfg, message, sender, recipient, quiet)
+
+    info("sent encrypted to %s (%d bytes of ciphertext, %d attachment(s))."
+         % (recipient, len(ciphertext), len(attachments)), quiet)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Fail as exc:
+        sys.stderr.write("send-secure-mail: ERROR: %s\n" % exc)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.stderr.write("\nsend-secure-mail: aborted\n")
+        sys.exit(130)

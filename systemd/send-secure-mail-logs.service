@@ -1,0 +1,16 @@
+[Unit]
+Description=Send an encrypted log summary by mail
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Last 24 hours of the journal from priority "warning" up, as a gzip attachment.
+ExecStart=/usr/local/bin/send-secure-mail --quiet --journal \
+          --journal-since=-1d --journal-priority warning \
+          --subject "Journal %H"
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

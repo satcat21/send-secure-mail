@@ -1,0 +1,5 @@
+# Never commit anyone's real key material or credentials.
+*.asc
+config.ini
+smtp-password
+*.bak.*
