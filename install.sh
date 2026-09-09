@@ -167,6 +167,16 @@ need_interactive() {
 input available - please pass it as an option (see --help)."
 }
 
+tmpfile GPG_ERR
+
+# Print the colon-format listing of the keys in a file, empty if it holds
+# none. --show-keys is a GnuPG 2.2.8 command; 2.1.x needs the import form.
+show_keys() {
+    gpg --batch --with-colons --show-keys "$1" 2>"$GPG_ERR" \
+    || gpg --batch --with-colons --import-options show-only \
+           --import "$1" 2>"$GPG_ERR"
+}
+
 # ------------------------------------------------------------- questions ---
 if [ "$INTERACTIVE" -eq 1 ]; then
     bold "=== send-secure-mail setup ==="
@@ -197,6 +207,14 @@ if [ -z "$KEY_FILE" ]; then
     # shellcheck disable=SC2012
     KEY_FILE="$(ls -1 "$SCRIPT_DIR"/publickey*.asc "$SCRIPT_DIR"/*.asc \
                 2>/dev/null | head -n1 || true)"
+    # An *.asc lying here need not actually hold a key - a common mishap is
+    # `gpg --locate-keys ADDR > recipient.asc`, which writes a listing, not
+    # a key. Drop such a file so the lookup below can still offer to help.
+    if [ -n "$KEY_FILE" ] && [ -z "$(show_keys "$KEY_FILE" || true)" ]; then
+        red "  $KEY_FILE holds no OpenPGP key - ignoring it."
+        sed 's/^/    /' "$GPG_ERR" >&2
+        KEY_FILE=""
+    fi
 fi
 
 # No key next to the installer - offer to fetch it from the recipient's
@@ -332,15 +350,6 @@ fi
 
 # ------------------------------------------------------------- check key ---
 bold "==> Checking the recipient key"
-tmpfile GPG_ERR
-
-# --show-keys is a GnuPG 2.2.8 command; 2.1.x needs the older import form.
-show_keys() {
-    gpg --batch --with-colons --show-keys "$1" 2>"$GPG_ERR" \
-    || gpg --batch --with-colons --import-options show-only \
-           --import "$1" 2>"$GPG_ERR"
-}
-
 KEYINFO="$(show_keys "$KEY_FILE" || true)"
 if [ -z "$KEYINFO" ]; then
     red "  gpg could not read $KEY_FILE - it said:"
