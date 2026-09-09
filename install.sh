@@ -45,6 +45,19 @@ grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 die()  { red "ERROR: $*"; exit 1; }
 
+TMPFILES=()
+cleanup() { [ "${#TMPFILES[@]}" -eq 0 ] || rm -f "${TMPFILES[@]}"; }
+trap cleanup EXIT
+# tmpfile VARNAME -> create a temp file, put its path in VARNAME, remove it
+# on exit. Sets a variable rather than printing, so that the caller does not
+# have to use a subshell (which would lose the TMPFILES entry).
+tmpfile() {
+    local __var="$1" __f
+    __f="$(mktemp)" || die "Could not create a temporary file."
+    TMPFILES+=("$__f")
+    printf -v "$__var" '%s' "$__f"
+}
+
 usage() {
     cat <<'USAGE'
 send-secure-mail installer (Linux and macOS)
@@ -185,12 +198,47 @@ if [ -z "$KEY_FILE" ]; then
     KEY_FILE="$(ls -1 "$SCRIPT_DIR"/publickey*.asc "$SCRIPT_DIR"/*.asc \
                 2>/dev/null | head -n1 || true)"
 fi
+
+# No key next to the installer - offer to fetch it from the recipient's
+# provider over WKD (how Proton Mail, mailbox.org and others publish keys).
+if [ -z "$KEY_FILE" ] && [ "$INTERACTIVE" -eq 1 ] \
+   && command -v gpg >/dev/null 2>&1; then
+    echo
+    echo "  No public key file was found next to the installer."
+    echo "  It can be looked up automatically in the recipient's Web Key"
+    echo "  Directory, or on the keyserver keys.openpgp.org."
+    ask_yn TRY_FETCH "Look up the public key online?" y
+    if [ "$TRY_FETCH" -eq 1 ]; then
+        ask FETCH_ADDR "Fetch the key for which address?" "$RECIPIENT"
+        tmpfile FETCH_ERR
+        tmpfile FETCH_OUT
+        echo "  Looking up $FETCH_ADDR ..."
+        # --locate-keys fetches and imports; it prints a listing, not the
+        # key itself, so the key is exported afterwards.
+        if gpg --batch --yes \
+               --auto-key-locate local,wkd,keyserver \
+               --keyserver hkps://keys.openpgp.org \
+               --locate-keys "$FETCH_ADDR" >/dev/null 2>"$FETCH_ERR" \
+           && gpg --batch --yes --armor --export "$FETCH_ADDR" \
+                  > "$FETCH_OUT" 2>>"$FETCH_ERR" \
+           && [ -s "$FETCH_OUT" ]; then
+            KEY_FILE="$FETCH_OUT"
+            grn "  Found a key for $FETCH_ADDR."
+            echo "  Check its fingerprint below before continuing."
+        else
+            red "  No key could be fetched for $FETCH_ADDR - gpg said:"
+            sed 's/^/    /' "$FETCH_ERR" >&2
+            echo "  Falling back to a local file."
+        fi
+    fi
+fi
+
 while [ -z "$KEY_FILE" ] || [ ! -f "$KEY_FILE" ]; do
     need_interactive "--key (public key)"
     [ -z "$KEY_FILE" ] || red "  File not found: $KEY_FILE"
     echo "  Export it from the recipient's provider (Proton Mail:"
     echo "  Settings > Encryption and keys > Export), or fetch it with"
-    echo "  gpg --locate-keys ADDRESS > recipient.asc"
+    echo "  gpg --locate-keys ADDRESS && gpg --armor --export ADDRESS > recipient.asc"
     ask KEY_FILE "Path to the public key (.asc)"
 done
 
@@ -284,11 +332,26 @@ fi
 
 # ------------------------------------------------------------- check key ---
 bold "==> Checking the recipient key"
-FPR="$(gpg --batch --with-colons --show-keys "$KEY_FILE" 2>/dev/null \
-        | awk -F: '/^fpr:/ {print $10; exit}')"
-[ -n "$FPR" ] || die "No PGP key could be read from $KEY_FILE."
-UIDS="$(gpg --batch --with-colons --show-keys "$KEY_FILE" 2>/dev/null \
-        | awk -F: '/^uid:/ {print $10}')"
+tmpfile GPG_ERR
+
+# --show-keys is a GnuPG 2.2.8 command; 2.1.x needs the older import form.
+show_keys() {
+    gpg --batch --with-colons --show-keys "$1" 2>"$GPG_ERR" \
+    || gpg --batch --with-colons --import-options show-only \
+           --import "$1" 2>"$GPG_ERR"
+}
+
+KEYINFO="$(show_keys "$KEY_FILE" || true)"
+if [ -z "$KEYINFO" ]; then
+    red "  gpg could not read $KEY_FILE - it said:"
+    sed 's/^/    /' "$GPG_ERR" >&2
+    red "  gpg version: $(gpg --version 2>/dev/null | head -n1)"
+    die "No PGP key could be read from $KEY_FILE."
+fi
+
+FPR="$(awk -F: '/^fpr:/ {print $10; exit}' <<<"$KEYINFO")"
+[ -n "$FPR" ] || die "No fingerprint found in $KEY_FILE."
+UIDS="$(awk -F: '/^uid:/ {print $10}' <<<"$KEYINFO")"
 
 echo "  File:        $KEY_FILE"
 echo "  Fingerprint: $FPR"

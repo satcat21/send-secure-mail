@@ -80,9 +80,15 @@ Provider features change, so check before relying on one.
 
 ### Getting the recipient's public key
 
+`install.sh` does this for you: when no `.asc` sits next to it, it offers to
+look the address up and shows the fingerprint for confirmation. To do it by
+hand — note that `--locate-keys` fetches and *imports* the key, printing only a
+listing, so the export is a second step:
+
 ```bash
 # Web Key Directory - works for Proton, mailbox.org and many others
-gpg --locate-keys someone@example.org > recipient.asc
+gpg --locate-keys someone@example.org
+gpg --armor --export someone@example.org > recipient.asc
 
 # or a keyserver
 gpg --keyserver hkps://keys.openpgp.org --search-keys someone@example.org
@@ -133,8 +139,9 @@ That is the whole command — the installer asks for everything it needs:
 
 1. Gmail address used as the sender, and a display name
 2. the recipient address
-3. the public key file (auto-detected if an `*.asc` sits next to the script),
-   then shows its fingerprint and user ID for confirmation
+3. the public key file — auto-detected if an `*.asc` sits next to the script,
+   otherwise it offers to fetch the key for the recipient over WKD or from
+   keys.openpgp.org — then shows its fingerprint and user ID for confirmation
 4. whether to set up msmtp as `sendmail`, or to speak SMTP directly
 5. whether to install the daily systemd timer
 6. the Gmail app password (hidden input, entered twice)
