@@ -59,6 +59,7 @@ DEFAULTS = {
     "sign_key": "",
     "sign_passphrase_file": "",
     "hide_subject": "yes",
+    "hidden_subject": "...",
     "subject_prefix": "",
     "max_attachment_bytes": str(5 * 1024 * 1024),
     "gzip_attachments": "yes",
@@ -447,6 +448,9 @@ def build_parser():
                         action="store_false",
                         help="keep the subject in the plaintext header, so it "
                              "is visible to Gmail")
+    parser.add_argument("--hidden-subject", metavar="TEXT", default=None,
+                        help="what the plaintext header shows while the real "
+                             "subject stays encrypted, default '...'")
     parser.add_argument("--sign", action="store_true",
                         help="sign as well (requires sign_key)")
     parser.add_argument("--transport", choices=["sendmail", "smtp"],
@@ -597,7 +601,8 @@ def main(argv):
     protected = None
     outer_subject = subject
     if hide_subject:
-        outer_subject = "..."
+        outer_subject = (args.hidden_subject if args.hidden_subject is not None
+                         else cfg.get("hidden_subject", "...")).strip() or "..."
         protected = {"Subject": subject, "From": sender, "To": recipient}
         # Also as plain text inside the encrypted part, in case the client
         # does not render protected headers.

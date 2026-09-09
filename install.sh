@@ -537,6 +537,9 @@ smtp_starttls      = yes
 # hide_subject=yes (default): only "..." goes out in the clear, the real
 # subject travels inside the encrypted part.
 hide_subject         = $([ "$HIDE_SUBJECT" -eq 1 ] && echo yes || echo no)
+# What goes out in the clear instead of the real subject. Visible to Gmail,
+# so keep it constant - e.g. a tag like "WG" to filter on.
+hidden_subject       = ...
 subject_prefix       =
 gzip_attachments     = yes
 max_attachment_bytes = 5242880

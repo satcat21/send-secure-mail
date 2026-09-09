@@ -39,6 +39,12 @@ the real subject once the message is open, marked with a padlock. The
 trade-off is the mailbox list, which shows `...` for every such mail. See
 [First test](#first-test--hello-world) for what that looks like.
 
+That placeholder is configurable — `hidden_subject = WG` in the config, or
+`--hidden-subject WG` for one mail, puts a fixed tag in the clear instead of
+`...`, so the mails can be told apart and filtered in the inbox list while the
+real subject stays encrypted. Whatever you choose is visible to Gmail, so keep
+it constant and uninformative: a tag identifies the *stream*, not the event.
+
 ---
 
 ## Who can receive these mails
@@ -330,6 +336,7 @@ send-secure-mail "test" --dry-run | less
 | `--gzip / --no-gzip` | compress attachments (default: on) |
 | `--max-size BYTES` | truncate attachments, keeping the **tail** (default 5 MiB) |
 | `--show-subject` | keep the subject in the plaintext header |
+| `--hidden-subject TEXT` | what the plaintext header shows instead of `...` |
 | `--transport smtp\|sendmail` | delivery path for this invocation |
 | `--dry-run` | print the finished message, send nothing |
 | `--sign` | sign as well (requires `sign_key`) |
